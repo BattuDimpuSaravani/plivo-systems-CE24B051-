@@ -1,0 +1,8 @@
+{
+ "up_bytes": 314920,
+ "down_bytes": 0,
+ "up_pkts": 1000,
+ "down_pkts": 0,
+ "dropped": 20,
+ "duplicated": 5
+}
