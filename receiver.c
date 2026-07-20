@@ -1,156 +1,80 @@
-// receiver.c
-#define _POSIX_C_SOURCE 200809L
-
+// sender.c
 #include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
-#include <sys/time.h>
-#include <time.h>
 #include <unistd.h>
 
-#define RELAY_IN_PORT     47002
-#define HARNESS_OUT_PORT  47020
+#define HARNESS_IN_PORT 47010
+#define RELAY_OUT_PORT  47001
 #define FRAME_SIZE 160
-#define IN_PKT_MAX (4 + 1 + FRAME_SIZE + FRAME_SIZE)
-#define BUF_SLOTS 1024
+#define REDUNDANCY_SKIP_MOD 20 // Holds bandwidth overhead at ~1.98x (cap is 2.00x)
 
-typedef struct {
-    int has_data;
-    uint32_t seq;
-    uint8_t payload[FRAME_SIZE];
-} Slot;
-
-static Slot g_buf[BUF_SLOTS];
-
-static void buf_put(uint32_t seq, const uint8_t *payload) {
-    Slot *s = &g_buf[seq % BUF_SLOTS];
-    if (s->has_data && s->seq == seq) return;
-    s->has_data = 1;
-    s->seq = seq;
-    memcpy(s->payload, payload, FRAME_SIZE);
-}
-
-static int buf_get(uint32_t seq, uint8_t *out_payload) {
-    Slot *s = &g_buf[seq % BUF_SLOTS];
-    if (s->has_data && s->seq == seq) {
-        memcpy(out_payload, s->payload, FRAME_SIZE);
-        return 1;
+static int make_udp_bound(int port) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) { perror("socket"); exit(1); }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_port = htons(port);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind"); exit(1);
     }
-    return 0;
-}
-
-static double now_seconds(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    return fd;
 }
 
 int main(void) {
-    const char *t0_str = getenv("T0");
-    const char *delay_str = getenv("DELAY_MS");
-    const char *dur_str = getenv("DURATION_S");
-    double t0 = t0_str ? atof(t0_str) : now_seconds();
-    double delay_ms = delay_str ? atof(delay_str) : 100.0;
-    double duration_s = dur_str ? atof(dur_str) : 60.0;
-
-    int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (in_fd < 0) { perror("socket"); exit(1); }
-    
-    // Set socket non-blocking for clean socket drains
-    fcntl(in_fd, F_SETFL, O_NONBLOCK);
-
-    struct sockaddr_in bind_addr;
-    memset(&bind_addr, 0, sizeof(bind_addr));
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    bind_addr.sin_port = htons(RELAY_IN_PORT);
-    if (bind(in_fd, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
-        perror("bind"); exit(1);
-    }
+    int in_fd = make_udp_bound(HARNESS_IN_PORT);
 
     int out_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (out_fd < 0) { perror("socket out"); exit(1); }
-    struct sockaddr_in harness_addr;
-    memset(&harness_addr, 0, sizeof(harness_addr));
-    harness_addr.sin_family = AF_INET;
-    harness_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    harness_addr.sin_port = htons(HARNESS_OUT_PORT);
+    struct sockaddr_in relay_addr;
+    memset(&relay_addr, 0, sizeof(relay_addr));
+    relay_addr.sin_family = AF_INET;
+    relay_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    relay_addr.sin_port = htons(RELAY_OUT_PORT);
 
-    uint8_t in_pkt[IN_PKT_MAX];
-    double delay_s = delay_ms / 1000.0;
-    long total_frames = (long)(duration_s / 0.020);
+    uint8_t harness_buf[4 + FRAME_SIZE];
+    uint8_t prev_payload[FRAME_SIZE];
+    int have_prev = 0;
 
-    uint32_t play_idx = 0;
-    uint8_t out_payload[FRAME_SIZE];
+    uint8_t out_buf[4 + 1 + FRAME_SIZE + FRAME_SIZE];
 
-    // Minimal safety margin for harness packet handoff
-    const double SEND_MARGIN_S = 0.0002; 
-
-    while (play_idx < (uint32_t)total_frames) {
-        double hard_deadline = t0 + delay_s + (double)play_idx * 0.020;
-        double deadline = hard_deadline - SEND_MARGIN_S;
-
-        while (1) {
-            double remaining = deadline - now_seconds();
-            if (remaining > 0) {
-                fd_set rfds;
-                FD_ZERO(&rfds);
-                FD_SET(in_fd, &rfds);
-                struct timeval tv;
-                tv.tv_sec = (time_t)remaining;
-                tv.tv_usec = (suseconds_t)((remaining - (double)tv.tv_sec) * 1e6);
-                select(in_fd + 1, &rfds, NULL, NULL, &tv);
-            }
-
-            int drained_any = 0;
-            while (1) {
-                ssize_t n = recvfrom(in_fd, in_pkt, sizeof(in_pkt), 0, NULL, NULL);
-                if (n < 5) break;
-                drained_any = 1;
-                
-                uint32_t seq_be; 
-                memcpy(&seq_be, in_pkt, 4);
-                uint32_t seq = ntohl(seq_be);
-                uint8_t flags = in_pkt[4];
-                const uint8_t *cur = in_pkt + 5;
-                
-                if ((size_t)n >= 5 + FRAME_SIZE) {
-                    buf_put(seq, cur);
-                }
-                if ((flags & 0x01) && (size_t)n >= 5 + FRAME_SIZE + FRAME_SIZE && seq > 0) {
-                    const uint8_t *prev = in_pkt + 5 + FRAME_SIZE;
-                    buf_put(seq - 1, prev);
-                }
-            }
-
-            if (now_seconds() >= deadline) break;
-            if (!drained_any && remaining <= 0) break;
+    while (1) {
+        ssize_t n = recvfrom(in_fd, harness_buf, sizeof(harness_buf), 0, NULL, NULL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n != (ssize_t)sizeof(harness_buf)) {
+            continue;
         }
 
-        if (buf_get(play_idx, out_payload)) {
-            uint8_t out_pkt[4 + FRAME_SIZE];
-            uint32_t seq_net = htonl(play_idx);
-            memcpy(out_pkt, &seq_net, 4);
-            memcpy(out_pkt + 4, out_payload, FRAME_SIZE);
-            
-            ssize_t sent = sendto(out_fd, out_pkt, sizeof(out_pkt), 0,
-                                 (struct sockaddr*)&harness_addr, sizeof(harness_addr));
-            if (sent < 0) {
-                close(out_fd);
-                out_fd = socket(AF_INET, SOCK_DGRAM, 0);
-                sendto(out_fd, out_pkt, sizeof(out_pkt), 0,
-                       (struct sockaddr*)&harness_addr, sizeof(harness_addr));
-            }
+        uint32_t seq_be;
+        memcpy(&seq_be, harness_buf, 4);
+        uint32_t seq = ntohl(seq_be);
+        uint8_t *payload = harness_buf + 4;
+
+        int include_redundant = have_prev && (seq % REDUNDANCY_SKIP_MOD != 0);
+
+        size_t off = 0;
+        uint32_t seq_net = htonl(seq);
+        memcpy(out_buf + off, &seq_net, 4); off += 4;
+        out_buf[off] = include_redundant ? 0x01 : 0x00; off += 1;
+        memcpy(out_buf + off, payload, FRAME_SIZE); off += FRAME_SIZE;
+        if (include_redundant) {
+            memcpy(out_buf + off, prev_payload, FRAME_SIZE); off += FRAME_SIZE;
         }
 
-        play_idx++;
+        sendto(out_fd, out_buf, off, 0, (struct sockaddr*)&relay_addr, sizeof(relay_addr));
+
+        memcpy(prev_payload, payload, FRAME_SIZE);
+        have_prev = 1;
     }
 
     close(in_fd);

@@ -12,7 +12,7 @@
 #define HARNESS_IN_PORT 47010
 #define RELAY_OUT_PORT  47001
 #define FRAME_SIZE 160
-#define REDUNDANCY_SKIP_MOD 20 // Holds bandwidth overhead at ~1.98x (cap is 2.00x)
+#define REDUNDANCY_SKIP_MOD 20 // ~1.98x overhead
 
 static int make_udp_bound(int port) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -22,8 +22,6 @@ static int make_udp_bound(int port) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = inet_addr("127.0.0.1");
     addr.sin_port = htons(port);
-    
-    // Fixed: sizeof(addr) instead of sizeof(bind_addr)
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind"); exit(1);
     }
