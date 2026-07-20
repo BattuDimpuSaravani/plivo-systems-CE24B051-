@@ -1,4 +1,13 @@
-// sender.c
+// receiver.c
+#define _POSIX_C_SOURCE 200809L
+// Listens on 127.0.0.1:47002 for packets from the relay (our wire format, see sender.c),
+// stores frames in a ring-buffer jitter buffer keyed by seq, recovers single losses from
+// the piggybacked redundant copy, and plays out one frame every 20ms on a wall-clock
+// schedule anchored at T0 + DELAY_MS, forwarding to the harness player on 127.0.0.1:47020
+// in the harness's own format (4-byte BE seq + 160-byte payload).
+//
+// Env vars provided by the harness: T0 (unix epoch seconds, float), DURATION_S, DELAY_MS.
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -6,75 +15,169 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
-#define HARNESS_IN_PORT 47010
-#define RELAY_OUT_PORT  47001
+#define RELAY_IN_PORT     47002
+#define HARNESS_OUT_PORT  47020
 #define FRAME_SIZE 160
-#define REDUNDANCY_SKIP_MOD 20 // Holds bandwidth overhead at ~1.98x (cap is 2.00x)
+#define IN_PKT_MAX (4 + 1 + FRAME_SIZE + FRAME_SIZE)
 
-static int make_udp_bound(int port) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) { perror("socket"); exit(1); }
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    addr.sin_port = htons(port);
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind"); exit(1);
+#define BUF_SLOTS 512 // ring buffer size; must exceed max reorder/jitter depth in frames
+
+typedef struct {
+    int has_data;
+    uint32_t seq; // seq stored to disambiguate ring-buffer wraparound aliasing
+    uint8_t payload[FRAME_SIZE];
+} Slot;
+
+static Slot g_buf[BUF_SLOTS];
+
+static void buf_put(uint32_t seq, const uint8_t *payload) {
+    Slot *s = &g_buf[seq % BUF_SLOTS];
+    if (s->has_data && s->seq == seq) return; // already have it (dup), don't bother rewriting
+    s->has_data = 1;
+    s->seq = seq;
+    memcpy(s->payload, payload, FRAME_SIZE);
+}
+
+// Returns 1 and fills out_payload if frame `seq` is present, else 0.
+static int buf_get(uint32_t seq, uint8_t *out_payload) {
+    Slot *s = &g_buf[seq % BUF_SLOTS];
+    if (s->has_data && s->seq == seq) {
+        memcpy(out_payload, s->payload, FRAME_SIZE);
+        return 1;
     }
-    return fd;
+    return 0;
+}
+
+static double now_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
 int main(void) {
-    int in_fd = make_udp_bound(HARNESS_IN_PORT);
+    const char *t0_str = getenv("T0");
+    const char *delay_str = getenv("DELAY_MS");
+    const char *dur_str = getenv("DURATION_S");
+    double t0 = t0_str ? atof(t0_str) : now_seconds();
+    double delay_ms = delay_str ? atof(delay_str) : 100.0;
+    double duration_s = dur_str ? atof(dur_str) : 60.0;
+
+    fprintf(stderr, "[receiver DEBUG] T0=%s DELAY_MS=%s DURATION_S=%s\n",
+            t0_str ? t0_str : "(null)", delay_str ? delay_str : "(null)",
+            dur_str ? dur_str : "(null)");
+    fprintf(stderr, "[receiver DEBUG] parsed t0=%.6f delay_ms=%.2f duration_s=%.2f now=%.6f (now-t0=%.3f)\n",
+            t0, delay_ms, duration_s, now_seconds(), now_seconds() - t0);
+
+    int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (in_fd < 0) { perror("socket"); exit(1); }
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    bind_addr.sin_port = htons(RELAY_IN_PORT);
+    if (bind(in_fd, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+        perror("bind"); exit(1);
+    }
 
     int out_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (out_fd < 0) { perror("socket out"); exit(1); }
-    struct sockaddr_in relay_addr;
-    memset(&relay_addr, 0, sizeof(relay_addr));
-    relay_addr.sin_family = AF_INET;
-    relay_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    relay_addr.sin_port = htons(RELAY_OUT_PORT);
+    struct sockaddr_in harness_addr;
+    memset(&harness_addr, 0, sizeof(harness_addr));
+    harness_addr.sin_family = AF_INET;
+    harness_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    harness_addr.sin_port = htons(HARNESS_OUT_PORT);
 
-    uint8_t harness_buf[4 + FRAME_SIZE];
-    uint8_t prev_payload[FRAME_SIZE];
-    int have_prev = 0;
+    uint8_t in_pkt[IN_PKT_MAX];
 
-    uint8_t out_buf[4 + 1 + FRAME_SIZE + FRAME_SIZE];
+    // Frame 0's deadline is t0 + delay_ms/1000; frame i's deadline is that + i*20ms.
+    double delay_s = delay_ms / 1000.0;
+    long total_frames = (long)(duration_s / 0.020) + 50; // small safety margin
 
-    while (1) {
-        ssize_t n = recvfrom(in_fd, harness_buf, sizeof(harness_buf), 0, NULL, NULL);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            break;
+    // The harness marks a frame late unless it lands on the player socket
+    // AT OR BEFORE t0+delay_ms+i*20ms. If we wait until that instant to even
+    // check the buffer and call sendto(), the syscall + loopback traversal +
+    // the harness's own recv wakeup all take a little real time, so the
+    // packet provably arrives a fraction of a millisecond AFTER the
+    // deadline -- every single frame gets marked a miss even though it
+    // physically got there almost instantly. Measured gap on this box is
+    // ~0.2-0.5ms; SEND_MARGIN_S below reserves comfortably more than that
+    // so we always transmit strictly before the real deadline.
+    const double SEND_MARGIN_S = 0.004; // 4ms
+
+    uint32_t play_idx = 0;
+    uint8_t out_payload[FRAME_SIZE];
+
+    while (play_idx < (uint32_t)total_frames) {
+        double hard_deadline = t0 + delay_s + (double)play_idx * 0.020;
+        // Send this early so the packet actually lands before hard_deadline
+        // (see SEND_MARGIN_S comment above).
+        double deadline = hard_deadline - SEND_MARGIN_S;
+
+        // Drain any packets that have arrived, until the deadline.
+        while (1) {
+            double remaining = deadline - now_seconds();
+            if (remaining <= 0) break;
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(in_fd, &rfds);
+            struct timeval tv;
+            tv.tv_sec = (time_t)remaining;
+            tv.tv_usec = (suseconds_t)((remaining - (double)tv.tv_sec) * 1e6);
+            int rv = select(in_fd + 1, &rfds, NULL, NULL, &tv);
+            if (rv <= 0) break; // timeout or error -> move on to deadline check
+            ssize_t n = recvfrom(in_fd, in_pkt, sizeof(in_pkt), 0, NULL, NULL);
+            if (n < 5) continue; // malformed
+            uint32_t seq_be; memcpy(&seq_be, in_pkt, 4);
+            uint32_t seq = ntohl(seq_be);
+            uint8_t flags = in_pkt[4];
+            const uint8_t *cur = in_pkt + 5;
+            if ((size_t)n < 5 + FRAME_SIZE) continue;
+            buf_put(seq, cur);
+            if ((flags & 0x01) && (size_t)n >= 5 + FRAME_SIZE + FRAME_SIZE && seq > 0) {
+                const uint8_t *prev = in_pkt + 5 + FRAME_SIZE;
+                buf_put(seq - 1, prev); // recover previous frame if we don't have it yet
+            }
         }
-        if (n != (ssize_t)sizeof(harness_buf)) {
-            continue;
+
+        // Deadline reached: emit frame play_idx if we have it, else it's a miss.
+        if (buf_get(play_idx, out_payload)) {
+            uint8_t out_pkt[4 + FRAME_SIZE];
+            uint32_t seq_net = htonl(play_idx);
+            memcpy(out_pkt, &seq_net, 4);
+            memcpy(out_pkt + 4, out_payload, FRAME_SIZE);
+            ssize_t sent = sendto(out_fd, out_pkt, sizeof(out_pkt), 0,
+                   (struct sockaddr*)&harness_addr, sizeof(harness_addr));
+            if (sent < 0) {
+                // A UDP socket can get "poisoned" by a delayed ICMP error from
+                // an earlier send (e.g. before the harness player finished
+                // binding); the fix is to drop it and open a fresh one.
+                close(out_fd);
+                out_fd = socket(AF_INET, SOCK_DGRAM, 0);
+                sent = sendto(out_fd, out_pkt, sizeof(out_pkt), 0,
+                       (struct sockaddr*)&harness_addr, sizeof(harness_addr));
+                if (sent < 0) {
+                    fprintf(stderr, "[receiver DEBUG] sendto FAILED twice frame %u: %s\n",
+                            play_idx, strerror(errno));
+                }
+            } else if ((size_t)sent != sizeof(out_pkt)) {
+                fprintf(stderr, "[receiver DEBUG] sendto SHORT WRITE frame %u: sent %zd of %zu\n",
+                        play_idx, sent, sizeof(out_pkt));
+            } else if (play_idx < 10 || play_idx % 100 == 0) {
+                fprintf(stderr, "[receiver DEBUG] sent frame %u OK (%zd bytes)\n", play_idx, sent);
+            }
+        }
+        else if (play_idx < 10 || play_idx % 100 == 0) {
+            fprintf(stderr, "[receiver DEBUG] MISS frame %u at deadline (now-deadline=%.3f)\n",
+                    play_idx, now_seconds() - deadline);
         }
 
-        uint32_t seq_be;
-        memcpy(&seq_be, harness_buf, 4);
-        uint32_t seq = ntohl(seq_be);
-        uint8_t *payload = harness_buf + 4;
-
-        int include_redundant = have_prev && (seq % REDUNDANCY_SKIP_MOD != 0);
-
-        size_t off = 0;
-        uint32_t seq_net = htonl(seq);
-        memcpy(out_buf + off, &seq_net, 4); off += 4;
-        out_buf[off] = include_redundant ? 0x01 : 0x00; off += 1;
-        memcpy(out_buf + off, payload, FRAME_SIZE); off += FRAME_SIZE;
-        if (include_redundant) {
-            memcpy(out_buf + off, prev_payload, FRAME_SIZE); off += FRAME_SIZE;
-        }
-
-        sendto(out_fd, out_buf, off, 0, (struct sockaddr*)&relay_addr, sizeof(relay_addr));
-
-        memcpy(prev_payload, payload, FRAME_SIZE);
-        have_prev = 1;
+        play_idx++;
     }
 
     close(in_fd);
