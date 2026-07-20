@@ -99,25 +99,11 @@ int main(void) {
     double delay_s = delay_ms / 1000.0;
     long total_frames = (long)(duration_s / 0.020) + 50; // small safety margin
 
-    // The harness marks a frame late unless it lands on the player socket
-    // AT OR BEFORE t0+delay_ms+i*20ms. If we wait until that instant to even
-    // check the buffer and call sendto(), the syscall + loopback traversal +
-    // the harness's own recv wakeup all take a little real time, so the
-    // packet provably arrives a fraction of a millisecond AFTER the
-    // deadline -- every single frame gets marked a miss even though it
-    // physically got there almost instantly. Measured gap on this box is
-    // ~0.2-0.5ms; SEND_MARGIN_S below reserves comfortably more than that
-    // so we always transmit strictly before the real deadline.
-    const double SEND_MARGIN_S = 0.004; // 4ms
-
     uint32_t play_idx = 0;
     uint8_t out_payload[FRAME_SIZE];
 
     while (play_idx < (uint32_t)total_frames) {
-        double hard_deadline = t0 + delay_s + (double)play_idx * 0.020;
-        // Send this early so the packet actually lands before hard_deadline
-        // (see SEND_MARGIN_S comment above).
-        double deadline = hard_deadline - SEND_MARGIN_S;
+        double deadline = t0 + delay_s + (double)play_idx * 0.020;
 
         // Drain any packets that have arrived, until the deadline.
         while (1) {
